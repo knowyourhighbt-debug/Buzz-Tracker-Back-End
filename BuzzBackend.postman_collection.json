@@ -1,0 +1,117 @@
+{
+  "info": {
+    "name": "Buzz Backend",
+    "_postman_id": "c5c24aaa-aaaa-bbbb-cccc-ddddeeefff00",
+    "description": "Test the Buzz backend endpoints",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "List strains",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/strains",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "strains"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Create strain",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"name\": \"Blue Dream\", \"thc\": 21, \"bucket\": \"hybrid\", \"terpenes\": [\"Myrcene\", \"Pinene\"]}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/strains",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "strains"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Resolve (by code param)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/strains/resolve?code=https://example.com/wedding-cake",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "strains",
+            "resolve"
+          ],
+          "query": [
+            {
+              "key": "code",
+              "value": "https://example.com/wedding-cake"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Scan Upload (form-data)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "image",
+              "type": "file",
+              "src": ""
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/strains/scan-upload?autocreate=1",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "strains",
+            "scan-upload"
+          ],
+          "query": [
+            {
+              "key": "autocreate",
+              "value": "1"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000"
+    }
+  ]
+}

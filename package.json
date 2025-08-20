@@ -1,0 +1,23 @@
+{
+  "name": "buzz-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "make-qr": "node make_qr.mjs"
+  },
+  "dependencies": {
+    "@zxing/library": "^0.20.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "pdf-parse": "^1.1.1",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.33.5"
+  }
+}
+
