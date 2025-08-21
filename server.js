@@ -39,10 +39,10 @@ app.get('/api/strains', (req, res) => res.json(STRAINS));
 
 // Get one by id
 app.get('/api/strains/:id', (req, res) => {
-  const id = String(req.params.id || '').toLowerCase();
-  const found = STRAINS.find(x => x.id === id);
-  if (!found) return res.status(404).json({ error: 'Not found' });
-  return res.json(found);
+  const id = String(req.params.id || '').trim().toLowerCase();
+  const s = STRAINS.find(x => String(x.id).toLowerCase() === id);
+  if (!s) return res.status(404).json({ error: 'not_found' });
+  res.json(s);
 });
 
 // Root + health
