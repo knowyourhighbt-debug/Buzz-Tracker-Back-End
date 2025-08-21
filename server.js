@@ -17,7 +17,7 @@ import {
 let _pdfParse = null;
 async function getPdfParse() {
   if (_pdfParse) return _pdfParse;
-  // Use the library entry to avoid any test harness code paths
+  // use library entry to avoid test harness path
   const mod = await import('pdf-parse/lib/pdf-parse.js');
   _pdfParse = mod.default || mod;
   return _pdfParse;
@@ -129,17 +129,35 @@ function upsertStrain(s) {
   else STRAINS.unshift(s);
 }
 
+function uniquePreserveOrder(arr) {
+  const seen = new Set();
+  return arr.filter(x => {
+    const k = String(x || '').toLowerCase().trim();
+    if (!k || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 function normalizeStrain(s) {
-  const terps = Array.isArray(s.terpenes)
+  // allow callers to pass either names (["Limonene",...]) or leave empty.
+  const rawTerps = Array.isArray(s.terpenes)
     ? s.terpenes
     : (s.terpenes ? String(s.terpenes).split(/[;,|\n\r]+/).map(x => x.trim()).filter(Boolean) : []);
+
+  // canonicalize names, dedupe, take top 3 (order preserved for manual posts)
+  const terpsCanon = uniquePreserveOrder(
+    rawTerps.map(normalizeTerpName)
+  ).slice(0, 3);
+
   return {
     id: s.id || toId(s.name),
     name: s.name,
     thc: s.thc == null ? undefined : Math.round(Number(String(s.thc).replace(/[^0-9.]/g, ''))),
     bucket: s.bucket || 'hybrid',
     lean: s.lean || (s.bucket === 'sativa_leaning' ? 'Sativa-leaning' : s.bucket === 'indica_leaning' ? 'Indica-leaning' : ''),
-    terpenes: terps
+    terpenes: terpsCanon,
+    dominantTerpene: terpsCanon[0] || ''
   };
 }
 
@@ -152,7 +170,7 @@ function rgbaToLuminance(rgba, width, height) {
   return out;
 }
 
-// --- Helper: derive a readable name from a URL slug/filename ---
+// derive a readable name from a URL slug/filename
 function guessNameFromCode(code) {
   try {
     const u = new URL(code);
@@ -163,35 +181,6 @@ function guessNameFromCode(code) {
   } catch {
     return null;
   }
-}
-
-// Terpene extraction that accepts %, mg/g (÷10), ppm (÷100)
-function extractTerpenesFromText(pdfRaw) {
-  const text = pdfRaw.replace(/\r/g, ' ').replace(/[ \t]+/g, ' ');
-  const pairs = [];
-  for (const terp of KNOWN_TERPENES) {
-    const variants = [
-      terp,
-      terp.replace('Alpha-', 'α-'),
-      terp.replace('Beta-', 'β-'),
-      terp.replace('-', ' '),
-    ].filter((v, i, a) => a.indexOf(v) === i);
-
-    const nameAlt = variants.map(v => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
-    const re = new RegExp(`(?:${nameAlt})\\s*[:=]?\\s*([0-9]+(?:\\.[0-9]+)?)\\s*(%|mg\\/g|ppm|parts\\s*per\\s*million)`, 'i');
-    const m = text.match(re);
-    if (!m) continue;
-
-    let val = Number(m[1]);
-    const unit = m[2].toLowerCase();
-    const pct =
-      unit.includes('ppm') || unit.includes('parts') ? +(val / 100).toFixed(2)
-        : unit === 'mg/g' ? +(val / 10).toFixed(2)
-        : val;
-
-    pairs.push({ name: normalizeTerpName(terp), pct });
-  }
-  return pickTopTerpenes(pairs, 6);
 }
 
 /* ================= Resolver & Scrapers ================= */
@@ -211,7 +200,7 @@ async function scrapeFromCode(code) {
 
   // Future: UPC/EAN handling…
 
-  // Demo fallback
+  // Demo fallback for development
   if (String(code).toLowerCase().includes('wedding-cake')) {
     return { name: 'Wedding Cake', thc: 23, bucket: 'hybrid', terpenes: ['Caryophyllene','Limonene','Humulene'] };
   }
@@ -229,7 +218,7 @@ const KNOWN_TERPENES = [
 
 function normalizeTerpName(name) {
   if (!name) return '';
-  // Normalize: map Greek letters and keep helpful punctuation
+  // map Greek letters, keep helpful punctuation
   let n = String(name)
     .replace(/α/gi, 'alpha')
     .replace(/β/gi, 'beta')
@@ -254,7 +243,7 @@ function normalizeTerpName(name) {
   if (n.includes('valencene')) return 'Valencene';
   if (n.includes('eucalyptol') || n.includes('cineole')) return 'Eucalyptol';
   if (n.includes('geraniol')) return 'Geraniol';
-  if (n.includes('fenchol') || n.includes('fenchyl')) return 'Fenchol'; // e.g., Fenchyl Alcohol
+  if (n.includes('fenchol') || n.includes('fenchyl')) return 'Fenchol'; // Fenchyl Alcohol → Fenchol
   if (n.includes('borneol')) return 'Borneol';
   if (n.includes('isopulegol')) return 'Isopulegol';
   if (n.includes('camphene')) return 'Camphene';
@@ -271,11 +260,60 @@ function guessBucketFromText(text) {
   return 'hybrid';
 }
 
-function pickTopTerpenes(pairs, max = 6) {
+// choose exactly the top three by measured % value
+function pickTopThree(pairs) {
+  // pairs: [{ name: 'Limonene', pct: 0.41 }, ...]
   const sorted = pairs
-    .filter(p => Number.isFinite(p.pct) && p.pct > 0)
+    .filter(p => p && p.name && Number.isFinite(p.pct) && p.pct > 0)
     .sort((a, b) => b.pct - a.pct);
-  return sorted.slice(0, max).map(p => p.name);
+
+  // canonicalize + dedupe by name (keep highest pct per name)
+  const out = [];
+  const seen = new Set();
+  for (const p of sorted) {
+    const nm = normalizeTerpName(p.name);
+    const key = nm.toLowerCase();
+    if (!seen.has(key)) {
+      out.push(nm);
+      seen.add(key);
+    }
+    if (out.length === 3) break; // only the big three
+  }
+  return out;
+}
+
+// text-wide terpene search that accepts %, mg/g (÷10), ppm (÷100 → %)
+function extractTerpenesFromText(pdfRaw) {
+  const text = pdfRaw.replace(/\r/g, ' ').replace(/[ \t]+/g, ' ');
+  const pairs = [];
+
+  for (const terp of KNOWN_TERPENES) {
+    const variants = [
+      terp,
+      terp.replace('Alpha-', 'α-'),
+      terp.replace('Beta-', 'β-'),
+      terp.replace('-', ' '),
+    ].filter((v, i, a) => a.indexOf(v) === i);
+
+    const nameAlt = variants.map(v => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+    const re = new RegExp(
+      `(?:${nameAlt})\\s*[:=]?\\s*([0-9]+(?:\\.[0-9]+)?)\\s*(%|mg\\/g|ppm|parts\\s*per\\s*million)`,
+      'i'
+    );
+    const m = text.match(re);
+    if (!m) continue;
+
+    let val = Number(m[1]);
+    const unit = m[2].toLowerCase();
+    const pct =
+      unit.includes('ppm') || unit.includes('parts') ? val / 100 :
+      unit === 'mg/g' ? val / 10 :
+      val;
+
+    pairs.push({ name: terp, pct });
+  }
+
+  return pickTopThree(pairs);
 }
 
 /** -------- Trulieve Lab PDF scraper (improved) -------- */
@@ -341,11 +379,8 @@ async function scrapeTrulieveLabPdf(url) {
     let value = parseFloat(m[2]);
     const unit = m[3].toLowerCase();
 
-    if (unit.includes('ppm') || unit.includes('parts')) {
-      value = value / 100;     // 100 ppm ≈ 0.1%
-    } else if (unit.includes('mg')) {
-      value = value / 10;      // 10 mg/g ≈ 1%
-    } // else already %
+    if (unit.includes('ppm') || unit.includes('parts')) value = value / 100; // 100 ppm ≈ 0.1%
+    else if (unit.includes('mg')) value = value / 10;                         // 10 mg/g ≈ 1%
 
     const normName = normalizeTerpName(rawName);
     if (
@@ -356,7 +391,14 @@ async function scrapeTrulieveLabPdf(url) {
       terpPairs.push({ name: normName, pct: value });
     }
   }
-  const terpenes = pickTopTerpenes(terpPairs, 6);
+
+  // exactly 3, sorted by dominance (highest first)
+  let terpenes = pickTopThree(terpPairs);
+
+  // fallback: try text-wide scan if the line-by-line didn’t catch them
+  if (!terpenes.length) {
+    terpenes = extractTerpenesFromText(raw);
+  }
 
   // 6) Bucket guess
   const bucket = guessBucketFromText(text);
