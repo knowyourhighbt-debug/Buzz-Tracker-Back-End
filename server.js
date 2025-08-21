@@ -144,6 +144,21 @@ function rgbaToLuminance(rgba, width, height) {
   return out;
 }
 
+// --- Helper: derive a readable name from a URL slug/filename ---
+function guessNameFromCode(code) {
+  try {
+    const u = new URL(code);
+    const last = (u.pathname.split('/').filter(Boolean).pop() || '').trim();
+    if (!last) return null;
+    // strip extension like .pdf/.html and prettify
+    const base = last.replace(/\.(pdf|html?)$/i, '');
+    return base.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
+  } catch {
+    return null;
+  }
+}
+
+
 /** ================= Resolver & Scrapers ================= */
 async function scrapeFromCode(code) {
   // If it’s a URL, pick a scraper by host/type
