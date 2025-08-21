@@ -13,6 +13,7 @@ import {
   HybridBinarizer,
 } from '@zxing/library';
 
+/* ================= PDF parse loader ================= */
 let _pdfParse = null;
 async function getPdfParse() {
   if (_pdfParse) return _pdfParse;
@@ -22,30 +23,33 @@ async function getPdfParse() {
   return _pdfParse;
 }
 
-
+/* ================= App ================= */
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-/** ================= In-memory "DB" ================= */
+/* ================= In-memory "DB" ================= */
 const STRAINS = [];
 const toId = (name) => String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 
-/** ================= API Endpoints ================= */
-// List
+/* ================= API Endpoints ================= */
+
+// List all
 app.get('/api/strains', (req, res) => res.json(STRAINS));
 
-// quick root page so Render sees a 200 at "/"
-app.get('/', (req, res) => {
-  res.send('Buzz backend is running. Try /api/strains');
+// Get one by id
+app.get('/api/strains/:id', (req, res) => {
+  const id = String(req.params.id || '').toLowerCase();
+  const found = STRAINS.find(x => x.id === id);
+  if (!found) return res.status(404).json({ error: 'Not found' });
+  return res.json(found);
 });
 
-// explicit health endpoint you (and Render) can hit
-app.get('/healthz', (req, res) => {
-  res.status(200).json({ ok: true });
-});
+// Root + health
+app.get('/', (req, res) => res.send('Buzz backend is running. Try /api/strains'));
+app.get('/healthz', (req, res) => res.status(200).json({ ok: true }));
 
-// Resolve by code (QR/UPC text)
+// Resolve by code (QR/UPC text or URL)
 app.get('/api/strains/resolve', async (req, res) => {
   const code = String(req.query.code || '').trim();
   if (!code) return res.status(400).json({ error: 'Missing code' });
@@ -54,7 +58,7 @@ app.get('/api/strains/resolve', async (req, res) => {
   return res.status(404).json({ error: 'Not found' });
 });
 
-// Create/upsert
+// Create/upsert (manual)
 app.post('/api/strains', (req, res) => {
   const { code, name, thc, bucket = 'hybrid', lean, terpenes } = req.body || {};
   if (!name || !String(name).trim()) return res.status(400).json({ error: 'name is required' });
@@ -63,14 +67,17 @@ app.post('/api/strains', (req, res) => {
   return res.status(201).json(strain);
 });
 
-// Upload QR/barcode image (no phone needed)
+// Upload QR/barcode image (server-side scan)
 const upload = multer({ storage: multer.memoryStorage() });
 app.post('/api/strains/scan-upload', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image provided' });
 
     // Decode to raw RGBA
-    const { data, info } = await sharp(req.file.buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    const { data, info } = await sharp(req.file.buffer)
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
     const luminance = rgbaToLuminance(data, info.width, info.height);
 
     // ZXing hints
@@ -88,7 +95,7 @@ app.post('/api/strains/scan-upload', upload.single('image'), async (req, res) =>
     const result = reader.decode(bitmap);
     const code = String(result.getText() || '').trim();
 
-    // Try to resolve
+    // Try to resolve & upsert into master list
     const resolved = await scrapeFromCode(code);
     if (resolved) {
       const norm = normalizeStrain(resolved);
@@ -96,7 +103,7 @@ app.post('/api/strains/scan-upload', upload.single('image'), async (req, res) =>
       return res.json({ code, status: 'resolved', strain: norm });
     }
 
-    // Optional create
+    // Optional: create a stub when unresolved
     if (String(req.query.autocreate || '') === '1') {
       const created = normalizeStrain({
         name: guessNameFromCode(code) || 'Unknown Strain',
@@ -114,7 +121,8 @@ app.post('/api/strains/scan-upload', upload.single('image'), async (req, res) =>
   }
 });
 
-/** ================= Helpers ================= */
+/* ================= Helpers ================= */
+
 function upsertStrain(s) {
   const i = STRAINS.findIndex((x) => x.id === s.id);
   if (i >= 0) STRAINS[i] = s;
@@ -150,7 +158,6 @@ function guessNameFromCode(code) {
     const u = new URL(code);
     const last = (u.pathname.split('/').filter(Boolean).pop() || '').trim();
     if (!last) return null;
-    // strip extension like .pdf/.html and prettify
     const base = last.replace(/\.(pdf|html?)$/i, '');
     return base.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
   } catch {
@@ -158,8 +165,37 @@ function guessNameFromCode(code) {
   }
 }
 
+// Terpene extraction that accepts %, mg/g (÷10), ppm (÷100)
+function extractTerpenesFromText(pdfRaw) {
+  const text = pdfRaw.replace(/\r/g, ' ').replace(/[ \t]+/g, ' ');
+  const pairs = [];
+  for (const terp of KNOWN_TERPENES) {
+    const variants = [
+      terp,
+      terp.replace('Alpha-', 'α-'),
+      terp.replace('Beta-', 'β-'),
+      terp.replace('-', ' '),
+    ].filter((v, i, a) => a.indexOf(v) === i);
 
-/** ================= Resolver & Scrapers ================= */
+    const nameAlt = variants.map(v => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+    const re = new RegExp(`(?:${nameAlt})\\s*[:=]?\\s*([0-9]+(?:\\.[0-9]+)?)\\s*(%|mg\\/g|ppm|parts\\s*per\\s*million)`, 'i');
+    const m = text.match(re);
+    if (!m) continue;
+
+    let val = Number(m[1]);
+    const unit = m[2].toLowerCase();
+    const pct =
+      unit.includes('ppm') || unit.includes('parts') ? +(val / 100).toFixed(2)
+        : unit === 'mg/g' ? +(val / 10).toFixed(2)
+        : val;
+
+    pairs.push({ name: normalizeTerpName(terp), pct });
+  }
+  return pickTopTerpenes(pairs, 6);
+}
+
+/* ================= Resolver & Scrapers ================= */
+
 async function scrapeFromCode(code) {
   // If it’s a URL, pick a scraper by host/type
   if (looksLikeUrl(code)) {
@@ -167,19 +203,15 @@ async function scrapeFromCode(code) {
     const host = u.hostname.toLowerCase();
     const path = u.pathname.toLowerCase();
 
-    // Trulieve lab PDF (like the one you scanned)
+    // Trulieve lab PDF
     if (host.includes('trulieve.com') && path.endsWith('.pdf')) {
       return await scrapeTrulieveLabPdf(code);
     }
-
-    // (Later) Trulieve product pages, other MMTCs, etc.
-    // if (host.includes('trulieve.com')) return await scrapeTrulieveProductPage(code);
   }
 
-  // UPC/EAN handling (future)
-  // if (/^\d{8,14}$/.test(code)) { ... }
+  // Future: UPC/EAN handling…
 
-  // Demo: allow local “wedding-cake” tests to still work
+  // Demo fallback
   if (String(code).toLowerCase().includes('wedding-cake')) {
     return { name: 'Wedding Cake', thc: 23, bucket: 'hybrid', terpenes: ['Caryophyllene','Limonene','Humulene'] };
   }
@@ -196,26 +228,38 @@ const KNOWN_TERPENES = [
 ];
 
 function normalizeTerpName(name) {
-  const n = String(name).toLowerCase().replace(/[^a-z- ]+/g,'');
+  if (!name) return '';
+  // Normalize: map Greek letters and keep helpful punctuation
+  let n = String(name)
+    .replace(/α/gi, 'alpha')
+    .replace(/β/gi, 'beta')
+    .toLowerCase()
+    .replace(/[^a-z\- ()+\/]+/g, '');
+
   if (n.includes('caryophyllene')) return 'Caryophyllene';
   if (n.includes('humulene')) return 'Humulene';
   if (n.includes('limonene')) return 'Limonene';
   if (n.includes('myrcene')) return 'Myrcene';
   if (n.includes('linalool')) return 'Linalool';
   if (n.includes('terpinolene')) return 'Terpinolene';
-  if (n.includes('pinene')) return n.includes('alpha') ? 'Alpha-Pinene' : n.includes('beta') ? 'Beta-Pinene' : 'Pinene';
+  if (n.includes('pinene')) {
+    if (n.includes('alpha')) return 'Alpha-Pinene';
+    if (n.includes('beta')) return 'Beta-Pinene';
+    return 'Pinene';
+  }
   if (n.includes('ocimene')) return 'Ocimene';
   if (n.includes('bisabolol')) return 'Bisabolol';
   if (n.includes('terpineol')) return 'Terpineol';
   if (n.includes('nerolidol')) return 'Nerolidol';
   if (n.includes('valencene')) return 'Valencene';
-  if (n.includes('eucalyptol')) return 'Eucalyptol';
+  if (n.includes('eucalyptol') || n.includes('cineole')) return 'Eucalyptol';
   if (n.includes('geraniol')) return 'Geraniol';
-  if (n.includes('fenchol')) return 'Fenchol';
+  if (n.includes('fenchol') || n.includes('fenchyl')) return 'Fenchol'; // e.g., Fenchyl Alcohol
   if (n.includes('borneol')) return 'Borneol';
   if (n.includes('isopulegol')) return 'Isopulegol';
   if (n.includes('camphene')) return 'Camphene';
-  return name.replace(/\s+/g,' ').trim();
+
+  return String(name).replace(/\s+/g, ' ').trim();
 }
 
 function guessBucketFromText(text) {
@@ -228,7 +272,9 @@ function guessBucketFromText(text) {
 }
 
 function pickTopTerpenes(pairs, max = 6) {
-  const sorted = pairs.filter(p => isFinite(p.pct) && p.pct > 0).sort((a,b) => b.pct - a.pct);
+  const sorted = pairs
+    .filter(p => Number.isFinite(p.pct) && p.pct > 0)
+    .sort((a, b) => b.pct - a.pct);
   return sorted.slice(0, max).map(p => p.name);
 }
 
@@ -239,7 +285,7 @@ async function scrapeTrulieveLabPdf(url) {
   if (!resp.ok) return null;
   const buf = Buffer.from(await resp.arrayBuffer());
 
-  // 2) Extract text (lazy-load pdf-parse for Render stability)
+  // 2) Extract text
   const pdfParse = await getPdfParse();
   const { text: pdfText } = await pdfParse(buf);
   const raw = (pdfText || '').replace(/\r/g, '');
@@ -248,47 +294,66 @@ async function scrapeTrulieveLabPdf(url) {
 
   // 3) Strain / Product name
   const namePatterns = [
-    /(?:Strain(?: Name)?|Product(?: Name)?|Product|Variety|Cultivar):\s*([^\n]+)\n?/i,
-    /(?:Item|Sample(?: Name)?):\s*([^\n]+)\n?/i
+    /(?:Strain(?: Name)?|Product(?: Name)?|Product|Variety|Cultivars?|Cultivar):\s*([^\n]+)\n?/i,
+    /(?:Item|Sample(?: Name)?):\s*([^\n]+)\n?/i,
   ];
   let name;
   for (const p of namePatterns) {
     const m = text.match(p);
-    if (m) { name = m[1].replace(/\s+/g,' ').trim(); break; }
+    if (m) { name = m[1].replace(/\s+/g, ' ').trim(); break; }
   }
   if (!name) name = guessNameFromCode(url) || 'Unknown Strain';
 
-  // 4) THC — prefer explicit "Total THC", else 0.877*THCA + Δ9THC
+  // 4) THC — prefer explicit "Total THC", else 0.877*THCA + Δ9THC (supports % or mg/g)
   let totalThc;
-  const mTotal = text.match(/Total\s*(?:Δ?9|Delta[-\s]?9)?\s*THC\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%/i);
+  const mTotal = text.match(
+    /Total\s*(?:Δ?9|Delta[-\s]?9)?\s*THC\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*(%|mg\s*\/\s*g)?/i
+  );
   if (mTotal) {
-    totalThc = Number(mTotal[1]);
+    const val = parseFloat(mTotal[1]);
+    const unit = (mTotal[2] || '%').toLowerCase();
+    totalThc = unit.includes('%') ? val : val / 10; // mg/g → %
   } else {
-    const mThca = text.match(/THC-?A\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%/i) || text.match(/\bTHCA\b\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%/i);
-    const mD9   = text.match(/(?:Δ?9|Delta[-\s]?9)\s*THC\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%/i) || text.match(/\bTHC\b\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%/i);
-    const thca = mThca ? Number(mThca[1]) : 0;
-    const d9   = mD9   ? Number(mD9[1])   : 0;
-    if (thca || d9) totalThc = Number((0.877 * thca + d9).toFixed(1));
+    const pick = (re) => {
+      const m = text.match(re);
+      if (!m) return undefined;
+      const v = parseFloat(m[1]);
+      const unit = (m[2] || '%').toLowerCase();
+      return unit.includes('%') ? v : v / 10; // mg/g → %
+    };
+    const thca = pick(/\bTHC-?A\b\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*(%|mg\s*\/\s*g)?/i);
+    const d9   = pick(/(?:Δ?9|Delta[-\s]?9)\s*THC\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*(%|mg\s*\/\s*g)?/i)
+              ?? pick(/\bTHC\b\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*(%|mg\s*\/\s*g)?/i);
+    const thcaVal = Number.isFinite(thca) ? thca : 0;
+    const d9Val   = Number.isFinite(d9) ? d9 : 0;
+    if (thcaVal || d9Val) totalThc = Number((0.877 * thcaVal + d9Val).toFixed(1));
   }
 
-  // 5) Terpenes — accept % OR mg/g (convert mg/g → % by ÷10)
+  // 5) Terpenes — accept %, mg/g (÷10), or ppm (÷100 → %)
   const terpPairs = [];
   for (const line of lines) {
-    let m = line.match(/^([A-Za-zµβ\- ]+?)\s+([0-9]+(?:\.[0-9]+)?)\s*%$/);
-    if (m) {
-      const n = normalizeTerpName(m[1]);
-      if (KNOWN_TERPENES.some(k => n.toLowerCase().includes(k.toLowerCase()))) {
-        terpPairs.push({ name: n, pct: Number(m[2]) });
-      }
-      continue;
-    }
-    m = line.match(/^([A-Za-zµβ\- ]+?)\s+([0-9]+(?:\.[0-9]+)?)\s*mg\/g\b/i);
-    if (m) {
-      const n = normalizeTerpName(m[1]);
-      if (KNOWN_TERPENES.some(k => n.toLowerCase().includes(k.toLowerCase()))) {
-        const pct = Number(m[2]) / 10; // 10 mg/g ≈ 1%
-        terpPairs.push({ name: n, pct: Number(pct.toFixed(2)) });
-      }
+    const m = line.match(
+      /^([A-Za-zµβ()\-+ ]+?)\s+([0-9]+(?:\.[0-9]+)?)\s*(%|mg\/g|ppm|parts\s*per\s*million)\b/i
+    );
+    if (!m) continue;
+
+    const rawName = m[1].trim();
+    let value = parseFloat(m[2]);
+    const unit = m[3].toLowerCase();
+
+    if (unit.includes('ppm') || unit.includes('parts')) {
+      value = value / 100;     // 100 ppm ≈ 0.1%
+    } else if (unit.includes('mg')) {
+      value = value / 10;      // 10 mg/g ≈ 1%
+    } // else already %
+
+    const normName = normalizeTerpName(rawName);
+    if (
+      normName &&
+      /[A-Za-z]/.test(normName) &&
+      KNOWN_TERPENES.some(k => normName.toLowerCase().includes(k.toLowerCase()))
+    ) {
+      terpPairs.push({ name: normName, pct: value });
     }
   }
   const terpenes = pickTopTerpenes(terpPairs, 6);
@@ -299,9 +364,10 @@ async function scrapeTrulieveLabPdf(url) {
   return { name, thc: totalThc, bucket, terpenes };
 }
 
-
-/** ================= Start ================= */
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Buzz backend listening on http://localhost:${port}`);
+/* ================= Start server ================= */
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Buzz backend listening on :${PORT}`);
 });
+
+export default app;
