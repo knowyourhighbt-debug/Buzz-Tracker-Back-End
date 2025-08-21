@@ -217,43 +217,65 @@ function pickTopTerpenes(pairs, max = 6) {
   return sorted.slice(0, max).map(p => p.name);
 }
 
-/** -------- Trulieve Lab PDF scraper -------- */
+/** -------- Trulieve Lab PDF scraper (improved) -------- */
 async function scrapeTrulieveLabPdf(url) {
   // 1) Download PDF
   const resp = await fetch(url);
   if (!resp.ok) return null;
   const buf = Buffer.from(await resp.arrayBuffer());
 
-  // 2) Extract text
-  const pdf = await getPdfParse();
-  const pdfData = await pdf(buf);
-  const textRaw = (pdfData.text || '').replace(/\r/g, '');
-  const text = textRaw.replace(/[ \t]+/g, ' '); // compress spaces
+  // 2) Extract text (lazy-load pdf-parse for Render stability)
+  const pdfParse = await getPdfParse();
+  const { text: pdfText } = await pdfParse(buf);
+  const raw = (pdfText || '').replace(/\r/g, '');
+  const text = raw.replace(/[ \t]+/g, ' ');                   // single-space
+  const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
 
-  // 3) Strain/Product name
-  let name =
-    (text.match(/(?:Strain|Product Name|Product):\s*([^\n]+)\n/i)?.[1] ||
-     text.match(/(?:Item|Sample Name):\s*([^\n]+)\n/i)?.[1] || null);
-  if (name) name = name.replace(/\s+/g,' ').trim();
+  // 3) Strain / Product name
+  const namePatterns = [
+    /(?:Strain(?: Name)?|Product(?: Name)?|Product|Variety|Cultivar):\s*([^\n]+)\n?/i,
+    /(?:Item|Sample(?: Name)?):\s*([^\n]+)\n?/i
+  ];
+  let name;
+  for (const p of namePatterns) {
+    const m = text.match(p);
+    if (m) { name = m[1].replace(/\s+/g,' ').trim(); break; }
+  }
   if (!name) name = guessNameFromCode(url) || 'Unknown Strain';
 
-  // 4) THC (prefer "Total THC")
-  let thc;
-  const mTotalTHC = text.match(/Total\s*THC[:\s]*([0-9]+(?:\.[0-9]+)?)\s*%/i);
-  const mAlt = text.match(/\bTHC\b[^%]{0,40}([0-9]+(?:\.[0-9]+)?)\s*%/i); // fallback
-  if (mTotalTHC) thc = Number(mTotalTHC[1]);
-  else if (mAlt) thc = Number(mAlt[1]);
+  // 4) THC — prefer explicit "Total THC", else 0.877*THCA + Δ9THC
+  let totalThc;
+  const mTotal = text.match(/Total\s*(?:Δ?9|Delta[-\s]?9)?\s*THC\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%/i);
+  if (mTotal) {
+    totalThc = Number(mTotal[1]);
+  } else {
+    const mThca = text.match(/THC-?A\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%/i) || text.match(/\bTHCA\b\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%/i);
+    const mD9   = text.match(/(?:Δ?9|Delta[-\s]?9)\s*THC\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%/i) || text.match(/\bTHC\b\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%/i);
+    const thca = mThca ? Number(mThca[1]) : 0;
+    const d9   = mD9   ? Number(mD9[1])   : 0;
+    if (thca || d9) totalThc = Number((0.877 * thca + d9).toFixed(1));
+  }
 
-  // 5) Terpenes (lines like "Limonene 0.45%" or "β-Caryophyllene 0.25%")
+  // 5) Terpenes — accept % OR mg/g (convert mg/g → % by ÷10)
   const terpPairs = [];
-  for (const line of text.split('\n')) {
-    const m = line.match(/([A-Za-zµβ\- ]+?)\s+([0-9]+(?:\.[0-9]+)?)\s*%/);
-    if (!m) continue;
-    const raw = m[1].trim();
-    const pct = Number(m[2]);
-    const norm = normalizeTerpName(raw);
-    if (KNOWN_TERPENES.some(k => norm.toLowerCase().includes(k.toLowerCase()))) {
-      terpPairs.push({ name: norm, pct });
+  for (const line of lines) {
+    // e.g., "Limonene 0.45%"
+    let m = line.match(/^([A-Za-zµβ\- ]+?)\s+([0-9]+(?:\.[0-9]+)?)\s*%$/);
+    if (m) {
+      const n = normalizeTerpName(m[1]);
+      if (KNOWN_TERPENES.some(k => n.toLowerCase().includes(k.toLowerCase()))) {
+        terpPairs.push({ name: n, pct: Number(m[2]) });
+      }
+      continue;
+    }
+    // e.g., "β-Caryophyllene 1.23 mg/g"
+    m = line.match(/^([A-Za-zµβ\- ]+?)\s+([0-9]+(?:\.[0-9]+)?)\s*mg\/g\b/i);
+    if (m) {
+      const n = normalizeTerpName(m[1]);
+      if (KNOWN_TERPENES.some(k => n.toLowerCase().includes(k.toLowerCase()))) {
+        const pct = Number(m[2]) / 10; // 10 mg/g ≈ 1%
+        terpPairs.push({ name: n, pct: Number(pct.toFixed(2)) });
+      }
     }
   }
   const terpenes = pickTopTerpenes(terpPairs, 6);
@@ -261,17 +283,9 @@ async function scrapeTrulieveLabPdf(url) {
   // 6) Bucket guess
   const bucket = guessBucketFromText(text);
 
-  return { name, thc, bucket, terpenes };
+  return { name, thc: totalThc, bucket, terpenes };
 }
 
-function guessNameFromCode(code) {
-  try {
-    const u = new URL(code);
-    const slug = u.pathname.split('/').filter(Boolean).pop();
-    if (slug) return slug.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-  } catch {}
-  return null;
-}
 
 /** ================= Start ================= */
 const port = process.env.PORT || 3000;
