@@ -3,7 +3,6 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import sharp from 'sharp';
-import pdf from 'pdf-parse';
 
 import {
   MultiFormatReader,
@@ -13,6 +12,16 @@ import {
   BinaryBitmap,
   HybridBinarizer,
 } from '@zxing/library';
+
+let _pdfParse = null;
+async function getPdfParse() {
+  if (_pdfParse) return _pdfParse;
+  // Use the library entry to avoid any test harness code paths
+  const mod = await import('pdf-parse/lib/pdf-parse.js');
+  _pdfParse = mod.default || mod;
+  return _pdfParse;
+}
+
 
 const app = express();
 app.use(cors());
@@ -216,6 +225,7 @@ async function scrapeTrulieveLabPdf(url) {
   const buf = Buffer.from(await resp.arrayBuffer());
 
   // 2) Extract text
+  const pdf = await getPdfParse();
   const pdfData = await pdf(buf);
   const textRaw = (pdfData.text || '').replace(/\r/g, '');
   const text = textRaw.replace(/[ \t]+/g, ' '); // compress spaces
