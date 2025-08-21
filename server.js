@@ -228,7 +228,7 @@ async function scrapeTrulieveLabPdf(url) {
   const pdfParse = await getPdfParse();
   const { text: pdfText } = await pdfParse(buf);
   const raw = (pdfText || '').replace(/\r/g, '');
-  const text = raw.replace(/[ \t]+/g, ' ');                   // single-space
+  const text = raw.replace(/[ \t]+/g, ' ');
   const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
 
   // 3) Strain / Product name
@@ -259,7 +259,6 @@ async function scrapeTrulieveLabPdf(url) {
   // 5) Terpenes — accept % OR mg/g (convert mg/g → % by ÷10)
   const terpPairs = [];
   for (const line of lines) {
-    // e.g., "Limonene 0.45%"
     let m = line.match(/^([A-Za-zµβ\- ]+?)\s+([0-9]+(?:\.[0-9]+)?)\s*%$/);
     if (m) {
       const n = normalizeTerpName(m[1]);
@@ -268,7 +267,6 @@ async function scrapeTrulieveLabPdf(url) {
       }
       continue;
     }
-    // e.g., "β-Caryophyllene 1.23 mg/g"
     m = line.match(/^([A-Za-zµβ\- ]+?)\s+([0-9]+(?:\.[0-9]+)?)\s*mg\/g\b/i);
     if (m) {
       const n = normalizeTerpName(m[1]);
