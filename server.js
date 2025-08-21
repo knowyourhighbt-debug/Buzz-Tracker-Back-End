@@ -26,6 +26,16 @@ const toId = (name) => String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '
 // List
 app.get('/api/strains', (req, res) => res.json(STRAINS));
 
+// quick root page so Render sees a 200 at "/"
+app.get('/', (req, res) => {
+  res.send('Buzz backend is running. Try /api/strains');
+});
+
+// explicit health endpoint you (and Render) can hit
+app.get('/healthz', (req, res) => {
+  res.status(200).json({ ok: true });
+});
+
 // Resolve by code (QR/UPC text)
 app.get('/api/strains/resolve', async (req, res) => {
   const code = String(req.query.code || '').trim();
