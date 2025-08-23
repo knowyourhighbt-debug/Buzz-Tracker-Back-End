@@ -62,6 +62,27 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.options('/api/scan', cors()); // allow OPTIONS preflight
+// Preflight for this route (ok to add even if you have global CORS)
+
+// Save-on-scan: parse → normalize → UPSERT → return saved strain
+app.post('/api/scan', async (req, res) => {
+  try {
+    const url = String(req.body?.url || req.body?.link || '').trim();
+    if (!url) return res.status(400).json({ error: 'Missing url' });
+
+    // These helpers should already exist in your server:
+    const parsed = await parseCoa(url);
+    const normalizedInput = coalesceParsedToStrain(parsed, url);
+    const norm = normalizeStrain(normalizedInput);
+
+    upsertStrain(norm); // persist/update master list
+
+    return res.json({ strain: norm, saved: true });
+  } catch (e) {
+    console.error('scan error', e);
+    return res.status(500).json({ error: 'scan_failed', detail: String(e?.message || e) });
+  }
+});
 
 
 /* ================= In-memory "DB" + JSON persistence ================= */
