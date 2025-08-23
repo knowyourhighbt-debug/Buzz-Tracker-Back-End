@@ -1,0 +1,44 @@
+[
+  {
+    "id": "836990007689144",
+    "code": "https://www.trulieve.com/content/dam/trulieve/en/lab-reports/83699_0007689144.pdf",
+    "name": "Raspberry Punch",
+    "thc": 15,
+    "bucket": "hybrid",
+    "lean": "",
+    "terpenes": [
+      "Caryophyllene",
+      "Myrcene",
+      "Limonene"
+    ],
+    "dominantTerpene": "Caryophyllene"
+  },
+  {
+    "id": "573470007429420",
+    "code": "https://www.trulieve.com/content/dam/trulieve/en/lab-reports/57347_0007429420.pdf",
+    "name": "Italian Diesel",
+    "thc": 15,
+    "bucket": "hybrid",
+    "lean": "",
+    "terpenes": [
+      "Caryophyllene",
+      "Limonene",
+      "Linalool"
+    ],
+    "dominantTerpene": "Caryophyllene"
+  },
+  {
+    "id": "weddingcake",
+    "code": "wedding-cake",
+    "name": "Wedding Cake",
+    "thc": 23,
+    "bucket": "hybrid",
+    "lean": "",
+    "terpenes": [
+      "Caryophyllene",
+      "Limonene",
+      "Humulene"
+    ],
+    "dominantTerpene": "Caryophyllene"
+  }
+]

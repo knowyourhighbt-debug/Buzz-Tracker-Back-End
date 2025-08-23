@@ -1,8 +1,20 @@
+// Buzz Tracker Backend — Clean Drop-In v12.2 (ESM)
+// ------------------------------------------------------------
+// Deps to install:
+//   npm i express cors multer sharp @zxing/library pdf-parse tesseract.js dotenv
+//   # If Node < 18: npm i node-fetch
+//
+// package.json should include: { "type": "module", "main": "server.js" }
+// ------------------------------------------------------------
+
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import sharp from 'sharp';
+import { promises as fs } from 'fs';
+import path from 'path';
+import os from 'os';
 
 import {
   MultiFormatReader,
@@ -11,166 +23,99 @@ import {
   RGBLuminanceSource,
   BinaryBitmap,
   HybridBinarizer,
+  GlobalHistogramBinarizer,
 } from '@zxing/library';
 
-/* ================= PDF parse loader ================= */
+import Tesseract from 'tesseract.js';
+
+// Bring in your CJS scraper (returns { sourceUrl, strain, dominantTerpene, otherTerpenes, thc, [type] })
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const { parseCoa } = require('./coa-scraper.cjs');
+
+/* ================= PdfParse loader ================= */
 let _pdfParse = null;
 async function getPdfParse() {
   if (_pdfParse) return _pdfParse;
-  // use library entry to avoid test harness path
-  const mod = await import('pdf-parse/lib/pdf-parse.js');
-  _pdfParse = mod.default || mod;
+  try {
+    const mod = await import('pdf-parse/lib/pdf-parse.js');
+    _pdfParse = mod.default || mod;
+  } catch {
+    const mod = await import('pdf-parse');
+    _pdfParse = mod.default || mod;
+  }
   return _pdfParse;
 }
 
-/* ================= App ================= */
+/* ================= fetch polyfill (Node < 18) ================= */
+let _fetch = null;
+async function getFetch() {
+  if (typeof fetch !== 'undefined') return fetch;
+  if (_fetch) return _fetch;
+  const mod = await import('node-fetch');
+  _fetch = mod.default || mod;
+  return _fetch;
+}
+
+/* ================= App & middleware ================= */
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.options('/api/scan', cors()); // allow OPTIONS preflight
 
-/* ================= In-memory "DB" ================= */
+
+/* ================= In-memory "DB" + JSON persistence ================= */
 const STRAINS = [];
 const toId = (name) => String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 
-/* ================= API Endpoints ================= */
+const DATA_DIR  = process.env.DATA_DIR  || path.resolve(process.cwd(), 'data');
+const DATA_FILE = process.env.DATA_FILE || path.join(DATA_DIR, 'strains.json');
 
-// List all
-app.get('/api/strains', (req, res) => res.json(STRAINS));
+async function ensureDir(p) { try { await fs.mkdir(p, { recursive: true }); } catch {} }
+async function ensureDataDir() { return ensureDir(DATA_DIR); }
 
-// Get one by id
-app.get('/api/strains/:id', (req, res) => {
-  const id = String(req.params.id || '').trim().toLowerCase();
-  const s = STRAINS.find(x => String(x.id).toLowerCase() === id);
-  if (!s) return res.status(404).json({ error: 'not_found' });
-  res.json(s);
-});
-
-// Root + health
-app.get('/', (req, res) => res.send('Buzz backend is running. Try /api/strains'));
-app.get('/healthz', (req, res) => res.status(200).json({ ok: true }));
-
-// Resolve by code (QR/UPC text or URL)
-app.get('/api/strains/resolve', async (req, res) => {
-  const code = String(req.query.code || '').trim();
-  if (!code) return res.status(400).json({ error: 'Missing code' });
-  const data = await scrapeFromCode(code);
-  if (data) return res.json(normalizeStrain(data));
-  return res.status(404).json({ error: 'Not found' });
-});
-
-// Create/upsert (manual)
-app.post('/api/strains', (req, res) => {
-  const { code, name, thc, bucket = 'hybrid', lean, terpenes } = req.body || {};
-  if (!name || !String(name).trim()) return res.status(400).json({ error: 'name is required' });
-  const strain = normalizeStrain({ code, name, thc, bucket, lean, terpenes });
-  upsertStrain(strain);
-  return res.status(201).json(strain);
-});
-
-// Upload QR/barcode image (server-side scan)
-const upload = multer({ storage: multer.memoryStorage() });
-app.post('/api/strains/scan-upload', upload.single('image'), async (req, res) => {
+async function loadDB() {
   try {
-    if (!req.file) return res.status(400).json({ error: 'No image provided' });
-
-    // Decode to raw RGBA
-    const { data, info } = await sharp(req.file.buffer)
-      .ensureAlpha()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    const luminance = rgbaToLuminance(data, info.width, info.height);
-
-    // ZXing hints
-    const hints = new Map();
-    hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-      BarcodeFormat.QR_CODE, BarcodeFormat.EAN_13, BarcodeFormat.EAN_8, BarcodeFormat.UPC_A, BarcodeFormat.UPC_E,
-      BarcodeFormat.CODE_128, BarcodeFormat.CODE_39, BarcodeFormat.ITF, BarcodeFormat.AZTEC,
-      BarcodeFormat.DATA_MATRIX, BarcodeFormat.PDF_417
-    ]);
-    const reader = new MultiFormatReader();
-    reader.setHints(hints);
-
-    const source = new RGBLuminanceSource(luminance, info.width, info.height);
-    const bitmap = new BinaryBitmap(new HybridBinarizer(source));
-    const result = reader.decode(bitmap);
-    const code = String(result.getText() || '').trim();
-
-    // Try to resolve & upsert into master list
-    const resolved = await scrapeFromCode(code);
-    if (resolved) {
-      const norm = normalizeStrain(resolved);
-      upsertStrain(norm);
-      return res.json({ code, status: 'resolved', strain: norm });
+    const raw = await fs.readFile(DATA_FILE, 'utf8');
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) {
+      STRAINS.splice(0, STRAINS.length, ...arr);
+      console.log(`[db] loaded ${STRAINS.length} strains from ${DATA_FILE}`);
     }
-
-    // Optional: create a stub when unresolved
-    if (String(req.query.autocreate || '') === '1') {
-      const created = normalizeStrain({
-        name: guessNameFromCode(code) || 'Unknown Strain',
-        thc: undefined,
-        bucket: 'hybrid',
-        terpenes: []
-      });
-      upsertStrain(created);
-      return res.json({ code, status: 'created', strain: created });
-    }
-
-    return res.status(404).json({ code, status: 'not_found' });
-  } catch (e) {
-    return res.status(422).json({ error: 'Decode failed', detail: String(e?.message || e) });
+  } catch {
+    console.log('[db] no existing DB, starting fresh');
   }
-});
-
-/* ================= Helpers ================= */
+}
+async function saveDB() {
+  try {
+    await ensureDataDir();
+    await fs.writeFile(DATA_FILE, JSON.stringify(STRAINS, null, 2), 'utf8');
+  } catch (e) {
+    console.warn('[db] save failed:', e?.message || e);
+  }
+}
 
 function upsertStrain(s) {
-  const i = STRAINS.findIndex((x) => x.id === s.id);
+  const i = STRAINS.findIndex((x) => String(x.id) === String(s.id));
   if (i >= 0) STRAINS[i] = s;
   else STRAINS.unshift(s);
+  saveDB().catch(() => {});
 }
 
-function uniquePreserveOrder(arr) {
-  const seen = new Set();
-  return arr.filter(x => {
-    const k = String(x || '').toLowerCase().trim();
-    if (!k || seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-}
-
-function normalizeStrain(s) {
-  // allow callers to pass either names (["Limonene",...]) or leave empty.
-  const rawTerps = Array.isArray(s.terpenes)
-    ? s.terpenes
-    : (s.terpenes ? String(s.terpenes).split(/[;,|\n\r]+/).map(x => x.trim()).filter(Boolean) : []);
-
-  // canonicalize names, dedupe, take top 3 (order preserved for manual posts)
-  const terpsCanon = uniquePreserveOrder(
-    rawTerps.map(normalizeTerpName)
-  ).slice(0, 3);
-
-  return {
-    id: s.id || toId(s.name),
-    name: s.name,
-    thc: s.thc == null ? undefined : Math.round(Number(String(s.thc).replace(/[^0-9.]/g, ''))),
-    bucket: s.bucket || 'hybrid',
-    lean: s.lean || (s.bucket === 'sativa_leaning' ? 'Sativa-leaning' : s.bucket === 'indica_leaning' ? 'Indica-leaning' : ''),
-    terpenes: terpsCanon,
-    dominantTerpene: terpsCanon[0] || ''
-  };
-}
-
-function rgbaToLuminance(rgba, width, height) {
-  const out = new Uint8ClampedArray(width * height);
-  for (let i = 0, j = 0; i < rgba.length; i += 4, j++) {
-    const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
-    out[j] = (0.2126 * r + 0.7152 * g + 0.0722 * b) | 0;
+function makeId(s = {}) {
+  if (s.id) return String(s.id);
+  if (s.code) {
+    try {
+      const u = new URL(String(s.code));
+      const last = (u.pathname.split('/').filter(Boolean).pop() || '');
+      const digits = last.replace(/\D+/g, '');
+      if (digits) return digits;
+    } catch {}
   }
-  return out;
+  return toId(s.name);
 }
 
-// derive a readable name from a URL slug/filename
+/* ===== Normalization helpers (for DB shape) ===== */
 function guessNameFromCode(code) {
   try {
     const u = new URL(code);
@@ -178,53 +123,20 @@ function guessNameFromCode(code) {
     if (!last) return null;
     const base = last.replace(/\.(pdf|html?)$/i, '');
     return base.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
-
-/* ================= Resolver & Scrapers ================= */
-
-async function scrapeFromCode(code) {
-  // If it’s a URL, pick a scraper by host/type
-  if (looksLikeUrl(code)) {
-    const u = new URL(code);
-    const host = u.hostname.toLowerCase();
-    const path = u.pathname.toLowerCase();
-
-    // Trulieve lab PDF
-    if (host.includes('trulieve.com') && path.endsWith('.pdf')) {
-      return await scrapeTrulieveLabPdf(code);
-    }
-  }
-
-  // Future: UPC/EAN handling…
-
-  // Demo fallback for development
-  if (String(code).toLowerCase().includes('wedding-cake')) {
-    return { name: 'Wedding Cake', thc: 23, bucket: 'hybrid', terpenes: ['Caryophyllene','Limonene','Humulene'] };
-  }
-
-  return null;
-}
-
-function looksLikeUrl(s) { try { new URL(s); return true; } catch { return false; } }
-
 const KNOWN_TERPENES = [
   'Myrcene','Limonene','Caryophyllene','Humulene','Linalool','Pinene','Alpha-Pinene','Beta-Pinene',
   'Terpinolene','Ocimene','Bisabolol','Camphene','Geraniol','Eucalyptol','Nerolidol','Terpineol',
   'Fenchol','Borneol','Isopulegol','Valencene'
 ];
-
 function normalizeTerpName(name) {
   if (!name) return '';
-  // map Greek letters, keep helpful punctuation
   let n = String(name)
     .replace(/α/gi, 'alpha')
     .replace(/β/gi, 'beta')
     .toLowerCase()
     .replace(/[^a-z\- ()+\/]+/g, '');
-
   if (n.includes('caryophyllene')) return 'Caryophyllene';
   if (n.includes('humulene')) return 'Humulene';
   if (n.includes('limonene')) return 'Limonene';
@@ -233,23 +145,79 @@ function normalizeTerpName(name) {
   if (n.includes('terpinolene')) return 'Terpinolene';
   if (n.includes('pinene')) {
     if (n.includes('alpha')) return 'Alpha-Pinene';
-    if (n.includes('beta')) return 'Beta-Pinene';
+    if (n.includes('beta'))  return 'Beta-Pinene';
     return 'Pinene';
   }
-  if (n.includes('ocimene')) return 'Ocimene';
+  if (n.includes('ocimene'))   return 'Ocimene';
   if (n.includes('bisabolol')) return 'Bisabolol';
   if (n.includes('terpineol')) return 'Terpineol';
   if (n.includes('nerolidol')) return 'Nerolidol';
   if (n.includes('valencene')) return 'Valencene';
   if (n.includes('eucalyptol') || n.includes('cineole')) return 'Eucalyptol';
-  if (n.includes('geraniol')) return 'Geraniol';
-  if (n.includes('fenchol') || n.includes('fenchyl')) return 'Fenchol'; // Fenchyl Alcohol → Fenchol
-  if (n.includes('borneol')) return 'Borneol';
-  if (n.includes('isopulegol')) return 'Isopulegol';
-  if (n.includes('camphene')) return 'Camphene';
-
+  if (n.includes('geraniol'))  return 'Geraniol';
+  if (n.includes('fenchol') || n.includes('fenchyl')) return 'Fenchol';
+  if (n.includes('borneol'))   return 'Borneol';
+  if (n.includes('isopulegol'))return 'Isopulegol';
+  if (n.includes('camphene'))  return 'Camphene';
   return String(name).replace(/\s+/g, ' ').trim();
 }
+
+
+function typeToBucket(type) {
+  const t = String(type || '').toLowerCase();
+  if (t.startsWith('indi')) return 'indica_leaning';
+  if (t.startsWith('sati')) return 'sativa_leaning';
+  return 'hybrid';
+}
+function bucketToLean(bucket) {
+  return bucket === 'indica_leaning' ? 'Indica-leaning'
+       : bucket === 'sativa_leaning' ? 'Sativa-leaning'
+       : '';
+}
+
+/** map scraper output -> normalizeStrain input shape (now includes type -> bucket/lean) */
+function coalesceParsedToStrain(parsed, url) {
+  const name = parsed?.strain || guessNameFromCode(url) || 'Unknown Strain';
+  const terps = [parsed?.dominantTerpene, ...(parsed?.otherTerpenes || [])]
+    .filter(Boolean)
+    .map(normalizeTerpName);
+  const thc   = parsed?.thc?.totalPercent ?? undefined;
+  const type  = parsed?.type || null; // <-- NEW: take type from scraper if present
+  const bucket = parsed?.bucket || (type ? typeToBucket(type) : 'hybrid');
+  const lean   = bucketToLean(bucket);
+  return { code: url, name, thc, bucket, lean, terpenes: terps, type };
+}
+
+function normalizeStrain(s) {
+  const terps = Array.isArray(s.terpenes)
+    ? s.terpenes
+    : (s.terpenes ? String(s.terpenes).split(/[;,|\n\r]+/).map(x => x.trim()).filter(Boolean) : []);
+  const top3 = terps.slice(0, 3);
+  const bucket = s.bucket || (s.type ? typeToBucket(s.type) : 'hybrid');
+  const lean   = s.lean || bucketToLean(bucket);
+  return {
+    id: makeId(s),
+    code: s.code || undefined,
+    name: s.name,
+    thc: s.thc == null ? undefined : Math.round(Number(String(s.thc).replace(/[^0-9.]/g, ''))),
+    bucket,
+    lean,
+    type: s.type || undefined,      // <-- keep type in DB
+    terpenes: top3,
+    dominantTerpene: top3[0] || ''
+  };
+}
+
+/* ================= Helpers used by scanner ================= */
+function rgbaToLuminance(rgba, width, height) {
+  const out = new Uint8ClampedArray(width * height);
+  for (let i = 0, j = 0; i < rgba.length; i += 4, j++) {
+    const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
+    out[j] = (0.2126 * r + 0.7152 * g + 0.0722 * b) | 0;
+  }
+  return out;
+}
+function looksLikeUrl(s) { try { new URL(s); return true; } catch { return false; } }
 
 function guessBucketFromText(text) {
   const m = text.match(/\b(Sativa|Indica|Hybrid)\b/i);
@@ -260,77 +228,199 @@ function guessBucketFromText(text) {
   return 'hybrid';
 }
 
-// choose exactly the top three by measured % value
-function pickTopThree(pairs) {
-  // pairs: [{ name: 'Limonene', pct: 0.41 }, ...]
-  const sorted = pairs
-    .filter(p => p && p.name && Number.isFinite(p.pct) && p.pct > 0)
-    .sort((a, b) => b.pct - a.pct);
+// --- Type helpers (single copy) ---
+const TYPE_MAP = { I: 'Indica', H: 'Hybrid', S: 'Sativa' };
 
-  // canonicalize + dedupe by name (keep highest pct per name)
-  const out = [];
-  const seen = new Set();
-  for (const p of sorted) {
-    const nm = normalizeTerpName(p.name);
-    const key = nm.toLowerCase();
-    if (!seen.has(key)) {
-      out.push(nm);
-      seen.add(key);
-    }
-    if (out.length === 3) break; // only the big three
-  }
-  return out;
+function parseType(text) {
+  if (!text) return null;
+  // TRU-Flower-...-I-FL or -H-FL or -S-FL
+  let m = text.match(/-([IHS])-[A-Z]{2}\b/);
+  if (m) return TYPE_MAP[m[1].toUpperCase()] || null;
+
+  // Fallback: words anywhere
+  m = text.match(/\b(Indica|Sativa|Hybrid)\b/i);
+  if (m) return m[1][0].toUpperCase() + m[1].slice(1).toLowerCase();
+
+  return null;
 }
 
-// text-wide terpene search that accepts %, mg/g (÷10), ppm (÷100 → %)
-function extractTerpenesFromText(pdfRaw) {
-  const text = pdfRaw.replace(/\r/g, ' ').replace(/[ \t]+/g, ' ');
+function bucketFromType(t) {
+  if (!t) return 'hybrid';
+  if (t === 'Indica') return 'indica_leaning';
+  if (t === 'Sativa') return 'sativa_leaning';
+  return 'hybrid';
+}
+
+
+function pickTopTerpenes(pairs, max = 3) {
+  const sorted = pairs
+    .filter(p => Number.isFinite(p.pct) && p.pct > 0)
+    .sort((a, b) => b.pct - a.pct);
+  return sorted.slice(0, max).map(p => p.name);
+}
+
+function detectColumnUnit(lines) {
+  const unitHeader = lines.find(l => /\bresult\s*\((%|mg\/g|ppm|µg\/g|ug\/g)\)/i.test(l));
+  if (unitHeader) {
+    const m = unitHeader.match(/\bresult\s*\((%|mg\/g|ppm|µg\/g|ug\/g)\)/i);
+    if (m) return m[1].toLowerCase();
+  }
+  const unitLine = lines.find(l => /\bunits?\s*:\s*(%|mg\/g|ppm|µg\/g|ug\/g)\b/i.test(l));
+  if (unitLine) {
+    const m = unitLine.match(/\bunits?\s*:\s*(%|mg\/g|ppm|µg\/g|ug\/g)\b/i);
+    if (m) return m[1].toLowerCase();
+  }
+  return null;
+}
+function toPercent(value, unit) {
+  if (!Number.isFinite(value)) return null;
+  if (!unit || unit === '%') return value;
+  unit = unit.toLowerCase();
+  if (unit.includes('mg/g')) return +(value * 0.1).toFixed(3);
+  if (unit.includes('ppm') || unit.includes('µg/g') || unit.includes('ug/g'))
+    return +(value / 10000).toFixed(4);
+  return value;
+}
+
+function buildTerpNameRegex() {
+  const names = KNOWN_TERPENES.map(t => {
+    const base = t
+      .replace('Alpha-', '(?:Alpha-|α-)')
+      .replace('Beta-',  '(?:Beta-|β-)')
+      .replace('-',      '[ \\-]?');
+    return base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  });
+  names.push('terpinolene','terpen[eo]l','terpene','pinene','myrcene','ocimene','humulene','caryophyllene','limonene','linalool','bisabolol','nerolidol','valencene','camphene','geraniol','eucalyptol','borneol','isopulegol','fenchol');
+  return new RegExp(`\\b(${names.join('|')})\\b`, 'i');
+}
+const TERP_NAME_RE = buildTerpNameRegex();
+
+function extractTerpenesSmart(raw, lines) {
+  const defaultUnit = detectColumnUnit(lines);
   const pairs = [];
 
-  for (const terp of KNOWN_TERPENES) {
-    const variants = [
-      terp,
-      terp.replace('Alpha-', 'α-'),
-      terp.replace('Beta-', 'β-'),
-      terp.replace('-', ' '),
-    ].filter((v, i, a) => a.indexOf(v) === i);
-
-    const nameAlt = variants.map(v => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
-    const re = new RegExp(
-      `(?:${nameAlt})\\s*[:=]?\\s*([0-9]+(?:\\.[0-9]+)?)\\s*(%|mg\\/g|ppm|parts\\s*per\\s*million)`,
-      'i'
-    );
-    const m = text.match(re);
+  for (const line of lines) {
+    if (!TERP_NAME_RE.test(line)) continue;
+    const m = line.match(/([A-Za-zα-ωΑ-Ωµμ()\/+.\- ]+?)\s*(?:[:\-–•·]|\s{2,})?\s*([0-9]+(?:\.[0-9]+)?|\.[0-9]+)\s*(%|mg\/g|ppm|µg\/g|ug\/g)?\b/i);
     if (!m) continue;
+    const rawName = m[1].trim();
+    const val = parseFloat(m[2]);
+    const unit = (m[3] || defaultUnit || '%').toLowerCase();
 
-    let val = Number(m[1]);
-    const unit = m[2].toLowerCase();
-    const pct =
-      unit.includes('ppm') || unit.includes('parts') ? val / 100 :
-      unit === 'mg/g' ? val / 10 :
-      val;
-
-    pairs.push({ name: terp, pct });
+    const normName = normalizeTerpName(rawName);
+    const pct = toPercent(val, unit);
+    if (!normName || !Number.isFinite(pct)) continue;
+    if (!KNOWN_TERPENES.some(k => normName.toLowerCase().includes(k.toLowerCase()))) continue;
+    pairs.push({ name: normName, pct });
   }
 
-  return pickTopThree(pairs);
+  if (!pairs.length) {
+    const dom = raw.match(/Dominant\s*Terpenes?\s*:\s*([^\n\r]+)/i);
+    if (dom) {
+      const names = dom[1].split(/[;,|]/).map(s => normalizeTerpName(s.trim())).filter(Boolean);
+      const uniq = [...new Set(names)];
+      return uniq.slice(0, 3);
+    }
+    for (const terp of KNOWN_TERPENES) {
+      const re = new RegExp(`${terp.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}[^\\n\\r]{0,40}?([0-9]+(?:\\.[0-9]+)?|\\.[0-9]+)\\s*(%|mg\\/g|ppm|µg\\/g|ug\\/g)?`, 'i');
+      const m = raw.match(re);
+      if (m) {
+        const pct = toPercent(parseFloat(m[1]), (m[2] || defaultUnit || '%'));
+        if (Number.isFinite(pct)) pairs.push({ name: normalizeTerpName(terp), pct });
+      }
+    }
+  }
+
+  return pickTopTerpenes(pairs, 3);
 }
 
-/** -------- Trulieve Lab PDF scraper (improved) -------- */
+/* ================= OCR & fetch helpers ================= */
+async function ocrExtractUrlOrBatch(buf, maxMs = 12000) {
+  const t0 = Date.now();
+  let base = sharp(buf).grayscale().normalize().sharpen();
+  const meta = await base.metadata();
+  const minW = 1200;
+  if ((meta.width || 0) < minW) base = base.resize({ width: minW });
+
+  const angles = [0, -6, 6, -10, 10];
+  const variants = [
+    (img) => img,
+    (img) => img.modulate({ brightness: 1.25 }),
+    (img) => img.linear(1.25, -5),
+    (img) => img.threshold(150),
+    (img) => img.threshold(190),
+    (img) => img.blur(0.4).threshold(165),
+  ];
+  function findFromText(text) {
+    if (!text) return null;
+    const direct = text.match(/https?:\/\/[^\s]+?\.pdf\b/i);
+    if (direct) return direct[0];
+    const mBatch = text.match(/\b(\d{5})[ _-]?(\d{7,})\b/);
+    if (mBatch) {
+      const a = mBatch[1];
+      const b = mBatch[2];
+      return `https://www.trulieve.com/content/dam/trulieve/en/lab-reports/${a}_${b}.pdf`;
+    }
+    return null;
+  }
+  for (const deg of angles) {
+    for (const v of variants) {
+      if (Date.now() - t0 > maxMs) return null;
+      let img = base.clone().rotate(deg);
+      try { img = v(img); } catch {}
+      const pre = await img.toBuffer();
+      try {
+        const { data } = await Tesseract.recognize(pre, 'eng', {
+          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_:/.-',
+          preserve_interword_spaces: '1',
+        });
+        const text = (data?.text || '').replace(/\r/g, ' ').replace(/[ \t]+/g, ' ').trim();
+        const found = findFromText(text);
+        if (found) return found;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+async function fetchPdfWithHeaders(url) {
+  const f = await getFetch();
+  let resp = await f(url, {
+    redirect: 'follow',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36',
+      'Accept': 'application/pdf,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Cache-Control': 'no-cache',
+    },
+  });
+  if (!resp.ok && (resp.status === 403 || resp.status === 406 || resp.status === 503)) {
+    resp = await f(url, {
+      redirect: 'follow',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36',
+        'Accept': 'application/pdf,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Referer': 'https://www.trulieve.com/',
+      },
+    });
+  }
+  return resp;
+}
+
+/* ================= Scrapers used by scanner resolve ================= */
 async function scrapeTrulieveLabPdf(url) {
-  // 1) Download PDF
-  const resp = await fetch(url);
+  const resp = await fetchPdfWithHeaders(url);
   if (!resp.ok) return null;
   const buf = Buffer.from(await resp.arrayBuffer());
 
-  // 2) Extract text
   const pdfParse = await getPdfParse();
   const { text: pdfText } = await pdfParse(buf);
   const raw = (pdfText || '').replace(/\r/g, '');
   const text = raw.replace(/[ \t]+/g, ' ');
   const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
 
-  // 3) Strain / Product name
   const namePatterns = [
     /(?:Strain(?: Name)?|Product(?: Name)?|Product|Variety|Cultivars?|Cultivar):\s*([^\n]+)\n?/i,
     /(?:Item|Sample(?: Name)?):\s*([^\n]+)\n?/i,
@@ -342,22 +432,19 @@ async function scrapeTrulieveLabPdf(url) {
   }
   if (!name) name = guessNameFromCode(url) || 'Unknown Strain';
 
-  // 4) THC — prefer explicit "Total THC", else 0.877*THCA + Δ9THC (supports % or mg/g)
   let totalThc;
-  const mTotal = text.match(
-    /Total\s*(?:Δ?9|Delta[-\s]?9)?\s*THC\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*(%|mg\s*\/\s*g)?/i
-  );
+  const mTotal = text.match(/Total\s*(?:Δ?9|Delta[-\s]?9)?\s*THC\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*(%|mg\s*\/\s*g)?/i);
   if (mTotal) {
     const val = parseFloat(mTotal[1]);
     const unit = (mTotal[2] || '%').toLowerCase();
-    totalThc = unit.includes('%') ? val : val / 10; // mg/g → %
+    totalThc = unit.includes('%') ? val : val / 10;
   } else {
     const pick = (re) => {
       const m = text.match(re);
       if (!m) return undefined;
       const v = parseFloat(m[1]);
       const unit = (m[2] || '%').toLowerCase();
-      return unit.includes('%') ? v : v / 10; // mg/g → %
+      return unit.includes('%') ? v : v / 10;
     };
     const thca = pick(/\bTHC-?A\b\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*(%|mg\s*\/\s*g)?/i);
     const d9   = pick(/(?:Δ?9|Delta[-\s]?9)\s*THC\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*(%|mg\s*\/\s*g)?/i)
@@ -367,49 +454,423 @@ async function scrapeTrulieveLabPdf(url) {
     if (thcaVal || d9Val) totalThc = Number((0.877 * thcaVal + d9Val).toFixed(1));
   }
 
-  // 5) Terpenes — accept %, mg/g (÷10), or ppm (÷100 → %)
-  const terpPairs = [];
-  for (const line of lines) {
-    const m = line.match(
-      /^([A-Za-zµβ()\-+ ]+?)\s+([0-9]+(?:\.[0-9]+)?)\s*(%|mg\/g|ppm|parts\s*per\s*million)\b/i
-    );
-    if (!m) continue;
-
-    const rawName = m[1].trim();
-    let value = parseFloat(m[2]);
-    const unit = m[3].toLowerCase();
-
-    if (unit.includes('ppm') || unit.includes('parts')) value = value / 100; // 100 ppm ≈ 0.1%
-    else if (unit.includes('mg')) value = value / 10;                         // 10 mg/g ≈ 1%
-
-    const normName = normalizeTerpName(rawName);
-    if (
-      normName &&
-      /[A-Za-z]/.test(normName) &&
-      KNOWN_TERPENES.some(k => normName.toLowerCase().includes(k.toLowerCase()))
-    ) {
-      terpPairs.push({ name: normName, pct: value });
-    }
-  }
-
-  // exactly 3, sorted by dominance (highest first)
-  let terpenes = pickTopThree(terpPairs);
-
-  // fallback: try text-wide scan if the line-by-line didn’t catch them
+  let terpenes = extractTerpenesSmart(raw, lines);
   if (!terpenes.length) {
-    terpenes = extractTerpenesFromText(raw);
+    terpenes = extractTerpenesSmart(raw.replace(/[ \t]+/g, ' '), lines);
   }
 
-  // 6) Bucket guess
-  const bucket = guessBucketFromText(text);
+  // NEW: detect type from the header (…-I-FL / -H- / -S-) OR words on page
+  const type = parseType(text);
+  const bucket = type ? typeToBucket(type) : guessBucketFromText(text);
 
-  return { name, thc: totalThc, bucket, terpenes };
+  return { name, thc: totalThc, bucket, type, terpenes };
 }
 
-/* ================= Start server ================= */
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Buzz backend listening on :${PORT}`);
+function looksLikePdfUrl(u) {
+  try { const x = new URL(u); return x.pathname.toLowerCase().endsWith('.pdf'); } catch { return false; }
+}
+
+async function scrapeFromCode(code) {
+  const codeStr = String(code || '');
+  if (looksLikeUrl(codeStr)) {
+    try {
+      const u = new URL(codeStr);
+      const host = u.hostname.toLowerCase();
+      const path = u.pathname.toLowerCase();
+      if (host.includes('trulieve.com') && path.endsWith('.pdf')) {
+        const r = await scrapeTrulieveLabPdf(codeStr);
+        if (r) return r;
+      }
+    } catch {}
+  }
+  if (codeStr.toLowerCase().includes('wedding-cake')) {
+    return { name: 'Wedding Cake', thc: 23, bucket: 'hybrid', type: 'Hybrid', terpenes: ['Caryophyllene','Limonene','Humulene'] };
+  }
+  return null;
+}
+
+/* ================= API: simple health & list ================= */
+app.get('/', (req, res) => res.send('Buzz backend is running. Try /api/strains'));
+app.get('/healthz', (req, res) => res.status(200).json({ ok: true }));
+app.get('/api/strains', (req, res) => res.json(STRAINS));
+
+/* ================= API: COA ingestion ================= */
+/** Minimal: return scraper output (no DB write) — supports POST and GET for easy phone testing */
+app.post('/api/ingest-coa', async (req, res) => {
+  try {
+    const url = String(req.body?.url || '').trim();
+    if (!url) return res.status(400).json({ error: 'Missing url' });
+    const parsed = await parseCoa(url);
+    return res.json(parsed); // NOTE: parsed now includes "type" if scraper implements it
+  } catch (e) {
+    return res.status(500).json({ error: 'ingest_failed', detail: String(e?.message || e) });
+  }
 });
+app.get('/api/ingest-coa', async (req, res) => {
+  try {
+    const url = String(req.query?.url || '').trim();
+    if (!url) return res.status(400).json({ error: 'Missing url' });
+    const parsed = await parseCoa(url);
+    return res.json(parsed);
+  } catch (e) {
+    return res.status(500).json({ error: 'ingest_failed', detail: String(e?.message || e) });
+  }
+});
+
+/** Normalized + optional upsert to DB (separate endpoint to avoid conflicts) */
+app.post('/api/strains/ingest', async (req, res) => {
+  try {
+    const url = String(req.body?.url || '').trim();
+    const doUpsert = req.body?.upsert === true || String(req.body?.upsert || '') === '1';
+    if (!url) return res.status(400).json({ error: 'Missing url' });
+
+    const parsed = await parseCoa(url);            // minimal fields (+ type if available)
+    const normalizedInput = coalesceParsedToStrain(parsed, url);
+    const norm = normalizeStrain(normalizedInput);
+
+    if (doUpsert) upsertStrain(norm);
+    return res.json(norm);
+  } catch (e) {
+    return res.status(500).json({ error: 'ingest_failed', detail: String(e?.message || e) });
+  }
+});
+// Minimal scan endpoint that your client expects
+app.post('/api/scan', async (req, res) => {
+  try {
+    const url = String(req.body?.url || req.body?.link || '').trim();
+    if (!url) return res.status(400).json({ error: 'Missing url' });
+
+    // Use your existing parser + normalizers
+    const parsed = await parseCoa(url);
+    const normalizedInput = coalesceParsedToStrain(parsed, url);
+    const norm = normalizeStrain(normalizedInput);
+
+    // Client expects { strain: {...} }
+    return res.json({ strain: norm });
+  } catch (e) {
+    return res.status(500).json({ error: 'scan_failed', detail: String(e?.message || e) });
+  }
+});
+
+
+/* ================= API: resolver & CRUD ================= */
+function safeDecode(s) { try { return decodeURIComponent(String(s)); } catch { return String(s); } }
+
+app.get('/api/strains/resolve', async (req, res) => {
+  const raw = typeof req.query.code === 'string' ? req.query.code : '';
+  const code = safeDecode(raw).trim();
+  if (!code) return res.status(400).json({ error: 'Missing code' });
+
+  try {
+    const data = await scrapeFromCode(code);
+    if (!data) return res.status(404).json({ error: 'Not found' });
+    const norm = normalizeStrain({ ...data, code });
+    if (String(req.query.upsert || '') === '1') upsertStrain(norm);
+    return res.json(norm);
+  } catch (err) {
+    return res.status(500).json({ error: 'resolve_failed', detail: String(err?.message || err) });
+  }
+});
+
+app.get('/api/strains/:id', (req, res) => {
+  const id = String(req.params.id || '').trim().toLowerCase();
+  const s = STRAINS.find(x => String(x.id).toLowerCase() === id);
+  if (!s) return res.status(404).json({ error: 'not_found' });
+  res.json(s);
+});
+
+app.post('/api/strains', (req, res) => {
+  const { code, name, thc, bucket, lean, terpenes, type } = req.body || {};
+  if (!name || !String(name).trim()) return res.status(400).json({ error: 'name is required' });
+  const strain = normalizeStrain({ code: safeDecode(code || ''), name, thc, bucket, lean, terpenes, type });
+  upsertStrain(strain);
+  return res.status(201).json(strain);
+});
+
+/* ================= API: photo scan (QR/COA code) ================= */
+const upload = multer({ storage: multer.memoryStorage() });
+
+app.post('/api/strains/scan-upload', upload.single('image'), async (req, res) => {
+  const t0 = Date.now();
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No image provided' });
+
+    const budgetMs = Math.max(1000, Math.min(60000, Number(req.query.budget_ms || process.env.SCAN_BUDGET_MS || 12000)));
+    const mode = String(req.query.mode || 'auto').toLowerCase(); // 'fast' | 'auto'
+    const debugSave = String(req.query.debug_save || '') === '1';
+    const skipOcr = String(req.query.skip_ocr || '') === '1';
+
+    const debugDir = path.join(DATA_DIR, 'debug', `scan_${Date.now()}`);
+    if (debugSave) await ensureDir(debugDir);
+    let attempts = 0;
+    async function saveAttempt(img, tag) {
+      if (!debugSave) return;
+      try {
+        const p = path.join(debugDir, `attempt_${String(++attempts).padStart(3,'0')}_${tag}.png`);
+        await img.png().toFile(p);
+      } catch {}
+    }
+
+    const hints = new Map();
+    hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+      BarcodeFormat.QR_CODE, BarcodeFormat.EAN_13, BarcodeFormat.EAN_8, BarcodeFormat.UPC_A, BarcodeFormat.UPC_E,
+      BarcodeFormat.CODE_128, BarcodeFormat.CODE_39, BarcodeFormat.ITF, BarcodeFormat.AZTEC,
+      BarcodeFormat.DATA_MATRIX, BarcodeFormat.PDF_417
+    ]);
+    hints.set(DecodeHintType.TRY_HARDER, true);
+    const reader = new MultiFormatReader();
+    reader.setHints(hints);
+
+    // Pre-resize & grayscale
+    let base0 = sharp(req.file.buffer).grayscale().normalize();
+    const meta0 = await base0.metadata();
+    const maxDim = 1800;
+    const needResize = Math.max(meta0.width || 0, meta0.height || 0) > maxDim;
+    if (needResize) {
+      base0 = base0.resize({ width: meta0.width >= meta0.height ? maxDim : undefined, height: meta0.height > meta0.width ? maxDim : undefined });
+    }
+
+    const fastRotations = [0, 90];
+    const fastPre = [ (img)=> img, (img)=> img.sharpen() ];
+    const fastUp = [1, 1.5, 2];
+    const minShortFast = 900;
+
+    const microAngles = [-8, -4, 0, 4, 8];
+    const baseAngles = [0, 90, 180, 270];
+    const heavyAngles = baseAngles.flatMap(b => microAngles.map(m => b + m));
+    const heavyCrops = [1.0, 0.92, 0.85, 0.75, 0.65];
+    const anchors = [
+      { name:'center', ax:0.5, ay:0.5 },
+      { name:'tl', ax:0.0, ay:0.0 },
+      { name:'tr', ax:1.0, ay:0.0 },
+      { name:'bl', ax:0.0, ay:1.0 },
+      { name:'br', ax:1.0, ay:1.0 },
+    ];
+    const heavyPre = [
+      (img)=> img, (img)=> img.sharpen(), (img)=> img.gamma(1.2), (img)=> img.linear(1.25, 0),
+      (img)=> img.modulate({ brightness: 1.18, saturation: 1.04 }), (img)=> img.blur(0.5),
+      (img)=> img.threshold(140), (img)=> img.threshold(170), (img)=> img.threshold(200),
+    ];
+    const heavyUp = [1, 1.5, 2, 3, 4];
+    const minShortHeavy = 1300;
+
+    const tEnd = () => (Date.now() - t0) > budgetMs;
+
+    async function tryDecodeFrom(img, minShort, upscales, tag) {
+      const m2 = await img.metadata();
+      for (const scale of upscales) {
+        const shortEdge = Math.min(m2.width || 0, m2.height || 0);
+        const factor = shortEdge > 0 ? Math.max(1, Math.ceil((minShort / shortEdge) * scale)) : 1;
+        const targetW = Math.max(48, Math.round((m2.width || minShort) * factor));
+        const piped = img.clone().resize({ width: targetW }).ensureAlpha();
+        await saveAttempt(piped.clone(), `${tag}_resize${targetW}`);
+
+        const { data, info } = await piped.raw().toBuffer({ resolveWithObject: true });
+        const luminance = rgbaToLuminance(data, info.width, info.height);
+        const source = new RGBLuminanceSource(luminance, info.width, info.height);
+        const attemptsHere = [
+          new BinaryBitmap(new HybridBinarizer(source)),
+          new BinaryBitmap(new GlobalHistogramBinarizer(source)),
+        ];
+
+        for (const bitmap of attemptsHere) {
+          try {
+            const result = reader.decode(bitmap);
+            const text = String(result.getText() || '').trim();
+            if (text) return text;
+          } catch {}
+          if (tEnd()) return null;
+        }
+      }
+      return null;
+    }
+
+    // FAST mode first
+    for (const deg of fastRotations) {
+      let base = base0.clone().rotate(deg);
+      for (const tweak of fastPre) {
+        let img; try { img = tweak(base.clone()); } catch { continue; }
+        const got = await tryDecodeFrom(img, minShortFast, fastUp, `fast_rot${deg}`);
+        if (got) {
+          const resolved = await scrapeFromCode(got);
+          if (resolved) {
+            const norm = normalizeStrain({ ...resolved, code: got });
+            upsertStrain(norm);
+            return res.json({ code: got, status: 'resolved', mode: 'fast', ms: Date.now()-t0, strain: norm });
+          }
+          if (String(req.query.autocreate || '') === '1') {
+            const created = normalizeStrain({ code: got, name: guessNameFromCode(got) || 'Unknown Strain', thc: undefined, bucket: 'hybrid', terpenes: [] });
+            upsertStrain(created);
+            return res.json({ code: got, status: 'created', mode: 'fast', ms: Date.now()-t0, strain: created });
+          }
+          return res.status(404).json({ code: got, status: 'not_found', mode: 'fast', ms: Date.now()-t0 });
+        }
+        if (tEnd()) break;
+      }
+      if (tEnd()) break;
+    }
+    if (mode === 'fast') {
+      return res.status(422).json({ error: 'Decode failed', detail: 'fast_path_exhausted', ms: Date.now()-t0 });
+    }
+
+    // HEAVY fallback
+    for (const deg of heavyAngles) {
+      let base = base0.clone().rotate(deg);
+      const meta = await base.metadata();
+      const W = meta.width || 0, H = meta.height || 0;
+      if (!W || !H) continue;
+
+      for (const cropFactor of heavyCrops) {
+        for (const a of anchors) {
+          let work = base;
+          if (cropFactor < 1.0) {
+            const s0 = Math.min(W, H) * cropFactor;
+            const s  = Math.max(2, Math.floor(s0));
+            const left = Math.max(0, Math.min(W - s, Math.round((W - s) * a.ax)));
+            const top  = Math.max(0, Math.min(H - s, Math.round((H - s) * a.ay)));
+            try { work = base.extract({ left, top, width: s, height: s }); } catch { work = base; }
+          }
+
+          for (const tweak of heavyPre) {
+            let img; try { img = tweak(work.clone()); } catch { continue; }
+            const tag = `heavy_rot${deg}_crop${Math.round(cropFactor*100)}_${a.name}_${tweak.name||'fx'}`;
+            const got = await tryDecodeFrom(img, minShortHeavy, heavyUp, tag);
+            if (got) {
+              const resolved = await scrapeFromCode(got);
+              if (resolved) {
+                const norm = normalizeStrain({ ...resolved, code: got });
+                upsertStrain(norm);
+                return res.json({ code: got, status: 'resolved', mode: 'heavy', ms: Date.now()-t0, strain: norm });
+              }
+              if (String(req.query.autocreate || '') === '1') {
+                const created = normalizeStrain({ code: got, name: guessNameFromCode(got) || 'Unknown Strain', thc: undefined, bucket: 'hybrid', terpenes: [] });
+                upsertStrain(created);
+                return res.json({ code: got, status: 'created', mode: 'heavy', ms: Date.now()-t0, strain: created });
+              }
+              return res.status(404).json({ code: got, status: 'not_found', mode: 'heavy', ms: Date.now()-t0 });
+            }
+            if (tEnd()) break;
+          }
+          if (tEnd()) break;
+        }
+        if (tEnd()) break;
+      }
+      if (tEnd()) break;
+    }
+
+    // OCR fallback
+    if (!skipOcr) {
+      const ocrUrl = await ocrExtractUrlOrBatch(await base0.clone().toBuffer(), Math.max(4000, Math.floor(budgetMs * 0.6)));
+      if (ocrUrl) {
+        const r = await scrapeFromCode(ocrUrl);
+        if (r) {
+          const norm = normalizeStrain({ ...r, code: ocrUrl });
+          upsertStrain(norm);
+          return res.json({ code: ocrUrl, status: 'resolved_via_ocr', mode: 'ocr', ms: Date.now()-t0, strain: norm });
+        } else {
+          return res.status(404).json({ code: ocrUrl, status: 'not_found_via_ocr', mode: 'ocr', ms: Date.now()-t0 });
+        }
+      }
+    }
+
+    return res.status(422).json({ error: 'Decode failed', detail: 'budget_exhausted', ms: Date.now()-t0 });
+  } catch (e) {
+    return res.status(422).json({ error: 'Decode failed', detail: String(e?.message || e) });
+  }
+});
+
+/* ================= Debug endpoints ================= */
+app.get('/api/debug/echo', (req, res) => {
+  const raw = String(req.query.code || '');
+  let decoded = raw; try { decoded = decodeURIComponent(raw); } catch {}
+  res.json({ raw, decoded });
+});
+
+app.get('/api/debug/fetch', async (req, res) => {
+  const raw = String(req.query.url || '');
+  let url = raw; try { url = decodeURIComponent(raw); } catch {}
+  if (!url) return res.status(400).json({ error: 'Missing url' });
+  try {
+    const r = await fetchPdfWithHeaders(url);
+    const ok = r.ok, status = r.status, statusText = r.statusText;
+    const ct = r.headers.get('content-type');
+    let bodyPreview = '';
+    try {
+      const ab = await r.arrayBuffer();
+      const slice = Buffer.from(ab).subarray(0, 512);
+      bodyPreview = slice.toString('base64');
+    } catch {}
+    res.json({ ok, status, statusText, contentType: ct, bodyPreviewBase64: bodyPreview });
+  } catch (e) {
+    res.status(500).json({ error: 'fetch_failed', detail: String(e?.message || e) });
+  }
+});
+
+app.get('/api/debug/terps', async (req, res) => {
+  const rawUrl = String(req.query.url || '');
+  if (!rawUrl) return res.status(400).json({ error: 'Missing url' });
+  try {
+    const r = await fetchPdfWithHeaders(rawUrl);
+    if (!r.ok) return res.status(502).json({ ok: false, status: r.status, statusText: r.statusText });
+    const buf = Buffer.from(await r.arrayBuffer());
+    const pdfParse = await getPdfParse();
+    const { text: pdfText } = await pdfParse(buf);
+    const raw = (pdfText || '').replace(/\r/g, '');
+    const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
+    const defaultUnit = detectColumnUnit(lines);
+    const terps = extractTerpenesSmart(raw, lines);
+    res.json({ ok: true, defaultUnit, terps, preview: lines.slice(0, 40) });
+  } catch (e) {
+    res.status(500).json({ error: 'terp_debug_failed', detail: String(e?.message || e) });
+  }
+});
+
+// OCR-only debug: upload a photo, get raw OCR text + detected URL/batch
+const debugUpload = multer({ storage: multer.memoryStorage() });
+app.post('/api/debug/ocr', debugUpload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No image provided' });
+    const urlOrBatch = await ocrExtractUrlOrBatch(req.file.buffer, 12000);
+
+    let base = sharp(req.file.buffer).grayscale().normalize().sharpen();
+    const meta = await base.metadata();
+    if ((meta.width || 0) < 1200) base = base.resize({ width: 1200 });
+    const pre = await base.toBuffer();
+
+    const { data } = await Tesseract.recognize(pre, 'eng', {
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_:/.-',
+      preserve_interword_spaces: '1',
+    });
+    const text = (data?.text || '').replace(/\r/g, ' ').replace(/[ \t]+/g, ' ').trim();
+
+    res.json({ ok: true, urlOrBatch, textPreview: text.slice(0, 2000) });
+  } catch (e) {
+    res.status(500).json({ error: 'ocr_debug_failed', detail: String(e?.message || e) });
+  }
+});
+
+/* ================= Start server (load DB first) ================= */
+const PORT = process.env.PORT || 3000;
+const HOST = '0.0.0.0';
+
+function getLAN() {
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name] || []) {
+      if (net.family === 'IPv4' && !net.internal) return net.address;
+    }
+  }
+  return 'localhost';
+}
+
+(async () => {
+  await ensureDataDir();
+  await loadDB();
+  app.listen(PORT, HOST, () => {
+    const lan = getLAN();
+    console.log(`Buzz backend listening on http://${HOST}:${PORT}`);
+    console.log(`LAN URL (use on your phone): http://${lan}:${PORT}`);
+  });
+})();
 
 export default app;
