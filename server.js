@@ -84,6 +84,34 @@ app.post('/api/scan', async (req, res) => {
   }
 });
 
+// Optional: if you don't already respond to OPTIONS globally, add this:
+app.options('/api/scan', (req, res) => res.sendStatus(204));
+
+// Save-on-scan: parse the URL, normalize it, UPSERT into your strains list, return it
+app.post('/api/scan', async (req, res) => {
+  try {
+    const url = String(req.body?.url || req.body?.link || '').trim();
+    if (!url) return res.status(400).json({ error: 'Missing url' });
+
+    // These helpers already exist in your server:
+    //   parseCoa(url) -> scrape/parse
+    //   coalesceParsedToStrain(parsed, url) -> shape to strain
+    //   normalizeStrain(strain) -> clean + defaults
+    //   upsertStrain(strain) -> persist/update in master list
+    const parsed = await parseCoa(url);
+    const normalizedInput = coalesceParsedToStrain(parsed, url);
+    const norm = normalizeStrain(normalizedInput);
+
+    upsertStrain(norm); // <-- persist to your strains store
+
+    return res.json({ strain: norm, saved: true });
+  } catch (e) {
+    console.error('scan error', e);
+    return res.status(500).json({ error: 'scan_failed', detail: String(e?.message || e) });
+  }
+});
+
+
 
 /* ================= In-memory "DB" + JSON persistence ================= */
 const STRAINS = [];
@@ -513,7 +541,29 @@ async function scrapeFromCode(code) {
 /* ================= API: simple health & list ================= */
 app.get('/', (req, res) => res.send('Buzz backend is running. Try /api/strains'));
 app.get('/healthz', (req, res) => res.status(200).json({ ok: true }));
-app.get('/api/strains', (req, res) => res.json(STRAINS));
+app.get('/api/strains', (req, res) => {
+  const total = STRAINS.length;
+
+  // Parse query params
+  const offsetRaw = req.query.offset;
+  const limitRaw  = req.query.limit;
+
+  const offset = Math.max(0, Number.isFinite(+offsetRaw) ? parseInt(offsetRaw, 10) : 0);
+
+  // If limit is not provided, keep the previous behavior: return everything from offset
+  const computedDefault = Math.max(0, total - offset);
+  const limitParam = (limitRaw === undefined || limitRaw === null || limitRaw === '')
+    ? computedDefault
+    : parseInt(limitRaw, 10);
+
+  // Per-response ceiling only; DOES NOT cap storage size.
+  const limit = Math.max(1, Math.min(5000, Number.isFinite(+limitParam) ? limitParam : computedDefault));
+
+  // Optional: paging metadata
+  res.set('X-Total-Count', String(total));
+
+  res.json(STRAINS.slice(offset, offset + limit));
+});
 
 /* ================= API: COA ingestion ================= */
 /** Minimal: return scraper output (no DB write) — supports POST and GET for easy phone testing */
@@ -538,19 +588,7 @@ app.get('/api/ingest-coa', async (req, res) => {
   }
 });
 
-/** Normalized + optional upsert to DB (separate endpoint to avoid conflicts) */
-app.post('/api/strains/ingest', async (req, res) => {
-  try {
-    const url = String(req.body?.url || '').trim();
-    const doUpsert = req.body?.upsert === true || String(req.body?.upsert || '') === '1';
-    if (!url) return res.status(400).json({ error: 'Missing url' });
-
-    const parsed = await parseCoa(url);            // minimal fields (+ type if available)
-    const normalizedInput = coalesceParsedToStrain(parsed, url);
-    const norm = normalizeStrain(normalizedInput);
-
-    if (doUpsert) upsertStrain(norm);
-    return res.json(norm);
+/** Normaliz    return res.json(norm);
   } catch (e) {
     return res.status(500).json({ error: 'ingest_failed', detail: String(e?.message || e) });
   }
