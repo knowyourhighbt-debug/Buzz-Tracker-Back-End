@@ -1,11 +1,4 @@
 // Buzz Tracker Backend — Clean Drop-In v12.2 (ESM)
-// ------------------------------------------------------------
-// Deps to install:
-//   npm i express cors multer sharp @zxing/library pdf-parse tesseract.js dotenv
-//   # If Node < 18: npm i node-fetch
-//
-// package.json should include: { "type": "module", "main": "server.js" }
-// ------------------------------------------------------------
 
 import 'dotenv/config';
 import express from 'express';
@@ -27,25 +20,19 @@ import {
 } from '@zxing/library';
 
 import Tesseract from 'tesseract.js';
+import { fileURLToPath } from 'url';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Bring in your CJS scraper (returns { sourceUrl, strain, dominantTerpene, otherTerpenes, thc, [type] })
+// ✅ Multer: define BEFORE any routes that use `upload`
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15 MB
+});
+
+// Bring in your CJS scraper (returns parsed COA fields)
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const { parseCoa } = require('./coa-scraper.cjs');
-
-/* ================= PdfParse loader ================= */
-let _pdfParse = null;
-async function getPdfParse() {
-  if (_pdfParse) return _pdfParse;
-  try {
-    const mod = await import('pdf-parse/lib/pdf-parse.js');
-    _pdfParse = mod.default || mod;
-  } catch {
-    const mod = await import('pdf-parse');
-    _pdfParse = mod.default || mod;
-  }
-  return _pdfParse;
-}
 
 /* ================= fetch polyfill (Node < 18) ================= */
 let _fetch = null;
@@ -57,61 +44,24 @@ async function getFetch() {
   return _fetch;
 }
 
+/* ================= pdf-parse lazy import ================= */
+let _pdfParse = null;
+async function getPdfParse() {
+  if (_pdfParse) return _pdfParse;
+  const mod = await import('pdf-parse');
+  const fn = mod.default || mod;
+  // Return a function that behaves like pdf-parse(buf) → { text, ... }
+  _pdfParse = (buf) => fn(buf);
+  return _pdfParse;
+}
+
 /* ================= App & middleware ================= */
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.options('/api/scan', cors()); // allow OPTIONS preflight
-// Preflight for this route (ok to add even if you have global CORS)
 
-// Save-on-scan: parse → normalize → UPSERT → return saved strain
-app.post('/api/scan', async (req, res) => {
-  try {
-    const url = String(req.body?.url || req.body?.link || '').trim();
-    if (!url) return res.status(400).json({ error: 'Missing url' });
-
-    // These helpers should already exist in your server:
-    const parsed = await parseCoa(url);
-    const normalizedInput = coalesceParsedToStrain(parsed, url);
-    const norm = normalizeStrain(normalizedInput);
-
-    upsertStrain(norm); // persist/update master list
-
-    return res.json({ strain: norm, saved: true });
-  } catch (e) {
-    console.error('scan error', e);
-    return res.status(500).json({ error: 'scan_failed', detail: String(e?.message || e) });
-  }
-});
-
-// Optional: if you don't already respond to OPTIONS globally, add this:
-app.options('/api/scan', (req, res) => res.sendStatus(204));
-
-// Save-on-scan: parse the URL, normalize it, UPSERT into your strains list, return it
-app.post('/api/scan', async (req, res) => {
-  try {
-    const url = String(req.body?.url || req.body?.link || '').trim();
-    if (!url) return res.status(400).json({ error: 'Missing url' });
-
-    // These helpers already exist in your server:
-    //   parseCoa(url) -> scrape/parse
-    //   coalesceParsedToStrain(parsed, url) -> shape to strain
-    //   normalizeStrain(strain) -> clean + defaults
-    //   upsertStrain(strain) -> persist/update in master list
-    const parsed = await parseCoa(url);
-    const normalizedInput = coalesceParsedToStrain(parsed, url);
-    const norm = normalizeStrain(normalizedInput);
-
-    upsertStrain(norm); // <-- persist to your strains store
-
-    return res.json({ strain: norm, saved: true });
-  } catch (e) {
-    console.error('scan error', e);
-    return res.status(500).json({ error: 'scan_failed', detail: String(e?.message || e) });
-  }
-});
-
-
+// Allow CORS preflight on /api/scan
+app.options('/api/scan', cors(), (req, res) => res.sendStatus(204));
 
 /* ================= In-memory "DB" + JSON persistence ================= */
 const STRAINS = [];
@@ -211,7 +161,6 @@ function normalizeTerpName(name) {
   return String(name).replace(/\s+/g, ' ').trim();
 }
 
-
 function typeToBucket(type) {
   const t = String(type || '').toLowerCase();
   if (t.startsWith('indi')) return 'indica_leaning';
@@ -231,7 +180,7 @@ function coalesceParsedToStrain(parsed, url) {
     .filter(Boolean)
     .map(normalizeTerpName);
   const thc   = parsed?.thc?.totalPercent ?? undefined;
-  const type  = parsed?.type || null; // <-- NEW: take type from scraper if present
+  const type  = parsed?.type || null; // take type from scraper if present
   const bucket = parsed?.bucket || (type ? typeToBucket(type) : 'hybrid');
   const lean   = bucketToLean(bucket);
   return { code: url, name, thc, bucket, lean, terpenes: terps, type };
@@ -251,7 +200,7 @@ function normalizeStrain(s) {
     thc: s.thc == null ? undefined : Math.round(Number(String(s.thc).replace(/[^0-9.]/g, ''))),
     bucket,
     lean,
-    type: s.type || undefined,      // <-- keep type in DB
+    type: s.type || undefined,      // keep type in DB
     terpenes: top3,
     dominantTerpene: top3[0] || ''
   };
@@ -279,27 +228,22 @@ function guessBucketFromText(text) {
 
 // --- Type helpers (single copy) ---
 const TYPE_MAP = { I: 'Indica', H: 'Hybrid', S: 'Sativa' };
-
 function parseType(text) {
   if (!text) return null;
   // TRU-Flower-...-I-FL or -H-FL or -S-FL
   let m = text.match(/-([IHS])-[A-Z]{2}\b/);
   if (m) return TYPE_MAP[m[1].toUpperCase()] || null;
-
   // Fallback: words anywhere
   m = text.match(/\b(Indica|Sativa|Hybrid)\b/i);
   if (m) return m[1][0].toUpperCase() + m[1].slice(1).toLowerCase();
-
   return null;
 }
-
 function bucketFromType(t) {
   if (!t) return 'hybrid';
   if (t === 'Indica') return 'indica_leaning';
   if (t === 'Sativa') return 'sativa_leaning';
   return 'hybrid';
 }
-
 
 function pickTopTerpenes(pairs, max = 3) {
   const sorted = pairs
@@ -508,7 +452,7 @@ async function scrapeTrulieveLabPdf(url) {
     terpenes = extractTerpenesSmart(raw.replace(/[ \t]+/g, ' '), lines);
   }
 
-  // NEW: detect type from the header (…-I-FL / -H- / -S-) OR words on page
+  // Detect type from the header (…-I-FL / -H- / -S-) OR words on page
   const type = parseType(text);
   const bucket = type ? typeToBucket(type) : guessBucketFromText(text);
 
@@ -550,7 +494,7 @@ app.get('/api/strains', (req, res) => {
 
   const offset = Math.max(0, Number.isFinite(+offsetRaw) ? parseInt(offsetRaw, 10) : 0);
 
-  // If limit is not provided, keep the previous behavior: return everything from offset
+  // If limit is not provided, return everything from offset
   const computedDefault = Math.max(0, total - offset);
   const limitParam = (limitRaw === undefined || limitRaw === null || limitRaw === '')
     ? computedDefault
@@ -566,13 +510,13 @@ app.get('/api/strains', (req, res) => {
 });
 
 /* ================= API: COA ingestion ================= */
-/** Minimal: return scraper output (no DB write) — supports POST and GET for easy phone testing */
+// Minimal: return scraper output (no DB write) — supports POST and GET
 app.post('/api/ingest-coa', async (req, res) => {
   try {
     const url = String(req.body?.url || '').trim();
     if (!url) return res.status(400).json({ error: 'Missing url' });
     const parsed = await parseCoa(url);
-    return res.json(parsed); // NOTE: parsed now includes "type" if scraper implements it
+    return res.json(parsed); // parsed includes "type" if scraper implements it
   } catch (e) {
     return res.status(500).json({ error: 'ingest_failed', detail: String(e?.message || e) });
   }
@@ -588,29 +532,23 @@ app.get('/api/ingest-coa', async (req, res) => {
   }
 });
 
-/** Normaliz    return res.json(norm);
-  } catch (e) {
-    return res.status(500).json({ error: 'ingest_failed', detail: String(e?.message || e) });
-  }
-});
-// Minimal scan endpoint that your client expects
+// Save-on-scan: parse the URL, normalize it, UPSERT into your strains list, return it
 app.post('/api/scan', async (req, res) => {
   try {
     const url = String(req.body?.url || req.body?.link || '').trim();
     if (!url) return res.status(400).json({ error: 'Missing url' });
 
-    // Use your existing parser + normalizers
     const parsed = await parseCoa(url);
     const normalizedInput = coalesceParsedToStrain(parsed, url);
     const norm = normalizeStrain(normalizedInput);
 
-    // Client expects { strain: {...} }
-    return res.json({ strain: norm });
+    upsertStrain(norm);
+    return res.json({ strain: norm, saved: true });
   } catch (e) {
+    console.error('scan error', e);
     return res.status(500).json({ error: 'scan_failed', detail: String(e?.message || e) });
   }
 });
-
 
 /* ================= API: resolver & CRUD ================= */
 function safeDecode(s) { try { return decodeURIComponent(String(s)); } catch { return String(s); } }
@@ -647,8 +585,6 @@ app.post('/api/strains', (req, res) => {
 });
 
 /* ================= API: photo scan (QR/COA code) ================= */
-const upload = multer({ storage: multer.memoryStorage() });
-
 app.post('/api/strains/scan-upload', upload.single('image'), async (req, res) => {
   const t0 = Date.now();
   try {
